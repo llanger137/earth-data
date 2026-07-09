@@ -1,0 +1,64 @@
+
+# Publish the smoke texture for the Earth app.
+#
+# Twice a day, ~40 min after each CAMS forecast run lands on the ADS,
+# fetch the biomass-burning AOD, flatten it to a greyscale opacity PNG,
+# and force-push it as the single-commit `data` branch — history stays
+# one commit deep, so the repo never grows. The app fetches
+#   https://raw.githubusercontent.com/<owner>/earth-data/data/smoke.png
+#
+# Until the ADS_API_KEY secret is configured the job skips green: a
+# dormant pipeline shouldn't nag with red crosses.
+name: smoke
+
+on:
+  schedule:
+    - cron: '40 10,22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      ADS_API_KEY: ${{ secrets.ADS_API_KEY }}
+    steps:
+      - name: Check for ADS credentials
+        id: creds
+        run: |
+          if [ -z "$ADS_API_KEY" ]; then
+            echo "::notice::ADS_API_KEY secret not set — skipping (see README)"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.creds.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.creds.outputs.go == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Fetch CAMS and build the texture
+        if: steps.creds.outputs.go == 'true'
+        run: |
+          pip install --quiet cdsapi xarray netcdf4 numpy pillow
+          python smoke_texture.py out/smoke.png
+
+      - name: Publish to the data branch
+        if: steps.creds.outputs.go == 'true'
+        run: |
+          cd out
+          git init -q -b data
+          git add smoke.png
+          git -c user.name="smoke bot" -c user.email="actions@github.com" \
+            commit -q -m "smoke $(date -u +%FT%TZ)"
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
