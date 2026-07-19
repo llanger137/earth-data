@@ -1,0 +1,88 @@
+# Publish the cloud textures for the Earth app.
+#
+# Hourly, ~45 min past the hour (GMGSI lands ~40 min after nominal time),
+# fetch NOAA's global IR mosaic, convert it to a visible-style cloud map
+# with matteason polar caps, and force-push the result as the
+# single-commit `data` branch. The prior branch tree is copied into the
+# workspace first so the rolling archive/ and any sibling datasets
+# survive each orphan commit — history stays one commit deep and the
+# repo size stays bounded at roughly the 7-day window.
+#
+# GMGSI is anonymous public S3: no secrets needed. If the newest frame
+# is already published, the build step reports updated=false and the
+# push is skipped.
+name: clouds
+
+on:
+  schedule:
+    - cron: '45 * * * *'
+  workflow_dispatch:
+
+# Both data workflows (clouds, smoke) force-push the same branch from a
+# seeded copy of its prior tree; serialize them so two seed/push windows
+# can't interleave and silently drop each other's files.
+concurrency:
+  group: data-branch
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Seed the prior data branch tree
+        run: |
+          mkdir -p out
+          # `--exit-code` returns 2 iff the ref doesn't exist — the
+          # legitimate first-ever run, the only time seeding may be
+          # skipped. Any other failure (network blip, GitHub 500) must
+          # fail the job: publishing from an unseeded tree would truncate
+          # the archive and drop sibling datasets.
+          rc=0
+          git ls-remote --exit-code origin data >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth 1 origin data
+            git archive FETCH_HEAD | tar -x -C out
+          elif [ "$rc" -ne 2 ]; then
+            echo "cannot reach origin (exit $rc); refusing an unseeded build"
+            exit "$rc"
+          fi
+
+      - name: Fetch GMGSI + matteason and build the textures
+        id: build
+        run: |
+          pip install --quiet numpy h5py pillow requests
+          python cloud_texture.py out/clouds
+          # Branch-served Pages runs a Jekyll build unless this exists;
+          # plain static serving is all we want.
+          touch out/.nojekyll
+
+      - name: Publish to the data branch
+        if: steps.build.outputs.updated == 'true'
+        # Commit from this checkout — which already holds the prior data
+        # commit via the seed fetch — not a fresh `git init` in out/: a
+        # history-less repo can't tell the remote already has ~255 MB of
+        # the blobs, so every hourly push would re-upload the whole tree
+        # (and strand the superseded copy server-side until GC). Built
+        # here, pack negotiation sees FETCH_HEAD on both ends and each
+        # push uploads only the hour's few new MB. History stays one
+        # orphan commit deep either way.
+        run: |
+          export GIT_WORK_TREE="$PWD/out" GIT_INDEX_FILE="$RUNNER_TEMP/data.index"
+          git add -A
+          tree=$(git write-tree)
+          commit=$(git -c user.name="clouds bot" -c user.email="actions@github.com" \
+            commit-tree -m "clouds $(date -u +%FT%TZ)" "$tree")
+          git push -q --force \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$commit:refs/heads/data"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

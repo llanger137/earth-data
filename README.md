@@ -5,6 +5,41 @@ published matteason-style: a scheduled Action fetches the science data,
 flattens it to a small texture, and force-pushes it to the single-commit
 `data` branch, where the app fetches it as a static file.
 
+## Clouds
+
+`clouds/` — global cloud cover as a matteason-style greyscale texture
+(equirectangular, lon −180…180 × lat 90…−90, white = cloud), rebuilt
+hourly.
+
+Source: [NOAA GMGSI](https://www.ospo.noaa.gov/products/imagery/gmgsi/)
+longwave-IR — the global geostationary mosaic on anonymous public S3
+(hourly, ~40 min latency, no credentials). Brightness temperature
+becomes a visible-style cloud mask in [ir_visible.py](ir_visible.py);
+GMGSI stops at ~72.7°, so the polar caps come from the
+[matteason](https://clouds.matteason.co.uk) visible cloud map (CC0),
+alpha-ramped in between 60° and 65° — tuned down from the nominal 64–71°
+band to keep the degraded Meteosat-IODC limb (a missing-data bowl
+bottoming ~66°N) below the blend. Pipeline and tuning constants
+(`BLEND_FULL`/`BLEND_NONE`) in [cloud_texture.py](cloud_texture.py).
+
+Published via GitHub Pages from the `data` branch:
+
+```
+https://llanger137.github.io/earth-data/clouds/current_8192.jpg   8192×4096
+https://llanger137.github.io/earth-data/clouds/current_4096.jpg   4096×2048
+https://llanger137.github.io/earth-data/clouds/manifest.json
+https://llanger137.github.io/earth-data/clouds/archive/<YYYYMMDDHH>.jpg
+```
+
+`manifest.json` is `{"latest", "frames", "window_hours"}`: `frames`
+lists the archived UTC hour stamps (ascending) over a rolling 7-day
+window; `archive/` holds exactly those frames at 4096×2048.
+
+One-time setup: push the repo, run the `clouds` workflow once by hand to
+seed the `data` branch, then enable GitHub Pages serving from `data` /
+root (Settings → Pages → Deploy from a branch). No secrets — GMGSI is
+anonymous.
+
 ## Smoke
 
 `smoke.png` — global wildfire smoke as a greyscale opacity map

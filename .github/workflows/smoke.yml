@@ -4,7 +4,9 @@
 # Twice a day, ~40 min after each CAMS forecast run lands on the ADS,
 # fetch the biomass-burning AOD, flatten it to a greyscale opacity PNG,
 # and force-push it as the single-commit `data` branch — history stays
-# one commit deep, so the repo never grows. The app fetches
+# one commit deep, so the repo never grows. The prior branch tree is
+# copied into the workspace first so sibling datasets (clouds/ and its
+# rolling archive) survive each orphan commit. The app fetches
 #   https://raw.githubusercontent.com/<owner>/earth-data/data/smoke.png
 #
 # Until the ADS_API_KEY secret is configured the job skips green: a
@@ -15,6 +17,13 @@ on:
   schedule:
     - cron: '40 10,22 * * *'
   workflow_dispatch:
+
+# Both data workflows (clouds, smoke) force-push the same branch from a
+# seeded copy of its prior tree; serialize them so two seed/push windows
+# can't interleave and silently drop each other's files.
+concurrency:
+  group: data-branch
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -43,6 +52,25 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Seed the prior data branch tree
+        if: steps.creds.outputs.go == 'true'
+        run: |
+          mkdir -p out
+          # `--exit-code` returns 2 iff the ref doesn't exist — the
+          # legitimate first-ever run, the only time seeding may be
+          # skipped. Any other failure (network blip, GitHub 500) must
+          # fail the job: publishing from an unseeded tree would wipe
+          # clouds/ (current textures, manifest, the rolling archive).
+          rc=0
+          git ls-remote --exit-code origin data >/dev/null || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            git fetch --depth 1 origin data
+            git archive FETCH_HEAD | tar -x -C out
+          elif [ "$rc" -ne 2 ]; then
+            echo "cannot reach origin (exit $rc); refusing an unseeded build"
+            exit "$rc"
+          fi
+
       - name: Fetch CAMS and build the texture
         if: steps.creds.outputs.go == 'true'
         run: |
@@ -51,14 +79,22 @@ jobs:
 
       - name: Publish to the data branch
         if: steps.creds.outputs.go == 'true'
+        # Commit from this checkout — which already holds the prior data
+        # commit via the seed fetch — not a fresh `git init` in out/: a
+        # history-less repo would re-upload the whole tree (clouds/ and
+        # its ~260 MB rolling archive included) on every push. Built
+        # here, pack negotiation sees FETCH_HEAD on both ends and only
+        # smoke.png's few hundred KB travel. `add -A`, not just
+        # smoke.png: the seeded prior tree must ride along in the orphan
+        # commit or this force-push would erase the sibling dataset.
         run: |
-          cd out
-          git init -q -b data
-          git add smoke.png
-          git -c user.name="smoke bot" -c user.email="actions@github.com" \
-            commit -q -m "smoke $(date -u +%FT%TZ)"
+          export GIT_WORK_TREE="$PWD/out" GIT_INDEX_FILE="$RUNNER_TEMP/data.index"
+          git add -A
+          tree=$(git write-tree)
+          commit=$(git -c user.name="smoke bot" -c user.email="actions@github.com" \
+            commit-tree -m "smoke $(date -u +%FT%TZ)" "$tree")
           git push -q --force \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            data
+            "$commit:refs/heads/data"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
