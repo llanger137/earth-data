@@ -15,9 +15,11 @@ Blend: pure GMGSI for |lat| <= BLEND_FULL, linear ramp to BLEND_NONE,
 pure matteason above. Outputs land in <outdir>: current_8192.jpg,
 current_4096.jpg, archive/<YYYYMMDDHH>.jpg (frame's own UTC hour, rolling
 WINDOW_HOURS deep), archive/flow/<YYYYMMDDHH>.png (optical flow over the
-hour that stamp starts, for shader-side advection), and manifest.json
+hour that stamp starts, for shader-side advection), archive/aurora/
+<YYYYMMDDHH>.png (the OVATION aurora nowcast baked to the app's texture,
+same rolling window), and manifest.json
 {"latest": stamp, "frames": [stamps ascending], "flows": [flow stamps],
-"window_hours": 168}.
+"aurora": [aurora stamps], "window_hours": 168}.
 Every frame in the lookback newer than the published latest is archived,
 not just the newest, so a failed or cancelled run's hour backfills on
 the next one instead of holing the window.
@@ -66,6 +68,15 @@ FLOW_PAD = 64  # horizontal wrap pad (px) so dateline motion reads short
 # measured mean 169 / std 78 (2026-07-18).
 MATTEASON_MEAN_MIN, MATTEASON_MEAN_MAX = 5.0, 250.0
 MATTEASON_STD_MIN = 20.0
+# Aurora nowcast: NOAA SWPC OVATION, a 1x1deg global grid of visible-aurora
+# probability, archived beside the clouds so History can replay it. bake_aurora
+# below MUST stay in lockstep with the app's AuroraService (aurora_service.dart)
+# — same equirect convention, same Gaussian, same 16-bit hi/lo split — or a
+# historical frame would decode unlike a live one.
+AURORA_URL = "https://services.swpc.noaa.gov/json/ovation_aurora_latest.json"
+AURORA_W, AURORA_H = 360, 181
+AURORA_BLUR_RADIUS = 4
+AURORA_BLUR_SIGMA = 1.5
 
 
 def find_frames(now):
@@ -283,8 +294,51 @@ def update_flows(frames, stamp, outdir):
     return sorted(flows)
 
 
-def write_outputs(px, stamp, outdir):
-    """current_8192/current_4096/archive frame, prune, rewrite manifest."""
+def bake_aurora(coordinates):
+    """OVATION [lon, lat, prob] grid -> (AURORA_H, AURORA_W, 4) uint8, the
+    same texture AuroraService bakes live (aurora_service.dart): equirect
+    (Greenwich at u=0.5, north pole at row 0), the spurious equator seam
+    dropped, a separable Gaussian (sigma 1.5, radius 4; longitude wraps,
+    latitude clamps), encoded 16-bit with the high byte in R, low in G, B
+    mirroring R, alpha opaque. Non-negative throughout, so round-half-up
+    (floor(x + 0.5)) matches Dart's round-half-away-from-zero exactly."""
+    arr = np.asarray(coordinates, dtype=np.float64).reshape(-1, 3)
+    lon = arr[:, 0].astype(np.int64)
+    lat = arr[:, 1].astype(np.int64)
+    keep = np.abs(lat) > 2  # OVATION emits a false low-value equator seam
+    col = (lon + 180) % AURORA_W  # u=0.5 <-> lon 0
+    row = 90 - lat  #                v=0   <-> lat +90
+    val = np.floor(arr[:, 2] / 100.0 * 255.0 + 0.5).clip(0, 255)
+    grid = np.zeros((AURORA_H, AURORA_W), np.float64)
+    grid[row[keep], col[keep]] = val[keep]
+
+    off = np.arange(-AURORA_BLUR_RADIUS, AURORA_BLUR_RADIUS + 1)
+    k = np.exp(-(off ** 2) / (2 * AURORA_BLUR_SIGMA ** 2))
+    knorm = k.sum()
+    tmp = np.zeros_like(grid)
+    for t, w in zip(off, k):
+        tmp += w * np.roll(grid, -int(t), axis=1)  # longitude is periodic
+    tmp /= knorm
+    rows = np.arange(AURORA_H)
+    out = np.zeros_like(grid)
+    for t, w in zip(off, k):
+        out += w * tmp[np.clip(rows + int(t), 0, AURORA_H - 1), :]  # poles clamp
+    out /= knorm
+
+    v16 = np.floor(out * 257.0 + 0.5).clip(0, 65535).astype(np.uint32)
+    rgba = np.empty((AURORA_H, AURORA_W, 4), np.uint8)
+    rgba[..., 0] = (v16 >> 8).astype(np.uint8)
+    rgba[..., 1] = (v16 & 0xFF).astype(np.uint8)
+    rgba[..., 2] = rgba[..., 0]
+    rgba[..., 3] = 255
+    return rgba
+
+
+def write_outputs(px, stamp, outdir, aurora_rgba=None):
+    """current_8192/current_4096/archive frame, prune, rewrite manifest.
+    When [aurora_rgba] is given it lands as this hour's aurora frame; the
+    manifest's aurora list is rebuilt from whatever aurora frames survive
+    the window regardless, so a skipped fetch just holds the last ones."""
     from PIL import Image
 
     os.makedirs(os.path.join(outdir, "archive"), exist_ok=True)
@@ -308,8 +362,29 @@ def write_outputs(px, stamp, outdir):
         else:
             frames.append(m.group(1))
     flows = update_flows(sorted(frames), stamp, outdir)
+
+    # Aurora: an independent layer on the same rolling window. It lands under
+    # the newest cloud hour's tag (OVATION has no past, so backfilled hours
+    # get none) and prunes by the same age rule.
+    auroradir = os.path.join(outdir, "archive", "aurora")
+    os.makedirs(auroradir, exist_ok=True)
+    if aurora_rgba is not None:
+        Image.fromarray(aurora_rgba, mode="RGBA").save(
+            os.path.join(auroradir, f"{tag}.png"))
+    aurora = []
+    for name in os.listdir(auroradir):
+        m = re.fullmatch(r"(\d{10})\.png", name)
+        if not m:
+            continue
+        t = dt.datetime.strptime(m.group(1), "%Y%m%d%H") \
+            .replace(tzinfo=dt.timezone.utc)
+        if (stamp - t) >= dt.timedelta(hours=WINDOW_HOURS):
+            os.remove(os.path.join(auroradir, name))
+        else:
+            aurora.append(m.group(1))
+
     manifest = {"latest": tag, "frames": sorted(frames), "flows": flows,
-                "window_hours": WINDOW_HOURS}
+                "aurora": sorted(aurora), "window_hours": WINDOW_HOURS}
     with open(os.path.join(outdir, "manifest.json"), "w") as f:
         json.dump(manifest, f)
     return manifest
@@ -412,6 +487,7 @@ def selftest():
     assert manifest == {"latest": "2026071900",
                         "frames": ["2026071823", "2026071900"],
                         "flows": ["2026071823"],
+                        "aurora": [],
                         "window_hours": WINDOW_HOURS}, manifest
     assert not os.path.exists(os.path.join(outdir, "archive",
                                            "2026071100.jpg")), "prune failed"
@@ -425,6 +501,39 @@ def selftest():
         (fp.size, fp.mode)
     assert np.abs(np.asarray(fp).astype(np.int16) - 128).max() <= 1, \
         "identical frames must encode as (near-)zero motion"
+
+    # Aurora bake: a 9x9 full-probability patch (radius-4 blur, so its centre
+    # sees only saturated taps) must peak at ~65535 in the 16-bit R/G split;
+    # B mirrors R, alpha is opaque, an on-equator cell is dropped, and the
+    # far hemisphere stays dark.
+    coords = []
+    for la in range(-90, 91):
+        for lo in range(360):
+            p = 100 if (196 <= lo <= 204 and 61 <= la <= 69) else 0
+            if lo == 200 and la == 0:
+                p = 100  # equator seam: bake must drop it
+            coords.append([lo, la, p])
+    aur = bake_aurora(coords)
+    assert aur.shape == (AURORA_H, AURORA_W, 4) and aur.dtype == np.uint8
+    assert np.array_equal(aur[..., 2], aur[..., 0]), "B must mirror R"
+    assert np.all(aur[..., 3] == 255), "alpha opaque"
+    ccol = (200 + 180) % AURORA_W
+    peak = (int(aur[90 - 65, ccol, 0]) << 8) | int(aur[90 - 65, ccol, 1])
+    assert peak >= 65000, f"saturated patch centre too dim: {peak}"
+    assert aur[90 - 0, ccol, 0] == 0 and aur[90 - 0, ccol, 1] == 0, \
+        "equator seam must be dropped"
+    assert aur[90 - (-80), (0 + 180) % AURORA_W, 0] == 0, "far cell not dark"
+
+    # Aurora archive lands under the newest hour, prunes stale on the window.
+    open(os.path.join(outdir, "archive", "aurora", "2026071100.png"),
+         "wb").close()
+    m2 = write_outputs(px, stamp, outdir, aur)
+    assert m2["aurora"] == ["2026071900"], m2["aurora"]
+    assert not os.path.exists(os.path.join(outdir, "archive", "aurora",
+                                           "2026071100.png")), "aurora prune"
+    ap = Image.open(os.path.join(outdir, "archive", "aurora", "2026071900.png"))
+    assert ap.size == (AURORA_W, AURORA_H) and ap.mode == "RGBA", \
+        (ap.size, ap.mode)
     print(f"selftest ok: {outdir}", px.shape)
 
 
@@ -477,6 +586,16 @@ def main():
         raise SystemExit(f"matteason frame fails content sanity "
                          f"(mean {mean:.1f}, std {std:.1f})")
 
+    # The aurora nowcast is "now", not per-frame — fetch it once and archive
+    # it under the newest hour. A hiccup here must not sink the cloud run, so
+    # a failure just skips this hour's aurora and holds the last ones.
+    aurora_rgba = None
+    try:
+        aurora_rgba = bake_aurora(json.loads(fetch(AURORA_URL))["coordinates"])
+    except Exception as e:
+        print(f"aurora fetch/bake failed, skipping this hour: {e}",
+              file=sys.stderr)
+
     # Backfilled hours reuse the current matteason canvas for their caps
     # (it's 3-hourly anyway); only the newest frame becomes current_*.
     for key in new:
@@ -485,7 +604,7 @@ def main():
         bad, lat, lon = orient(bad, lat, lon)
         px = composite(vis, bad, lat, lon, canvas)
         if key is new[-1]:
-            manifest = write_outputs(px, stamp, args.outdir)
+            manifest = write_outputs(px, stamp, args.outdir, aurora_rgba)
         else:
             write_archive_frame(px, stamp, args.outdir)
     set_output(True)
