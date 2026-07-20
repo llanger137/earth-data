@@ -59,7 +59,7 @@ jobs:
       - name: Fetch GMGSI + matteason and build the textures
         id: build
         run: |
-          pip install --quiet numpy h5py pillow requests
+          pip install --quiet numpy h5py pillow requests opencv-python-headless
           python cloud_texture.py out/clouds
           # Branch-served Pages runs a Jekyll build unless this exists;
           # plain static serving is all we want.

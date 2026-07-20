@@ -14,8 +14,10 @@ to matteason instead of printing as saturated white.
 Blend: pure GMGSI for |lat| <= BLEND_FULL, linear ramp to BLEND_NONE,
 pure matteason above. Outputs land in <outdir>: current_8192.jpg,
 current_4096.jpg, archive/<YYYYMMDDHH>.jpg (frame's own UTC hour, rolling
-WINDOW_HOURS deep), and manifest.json
-{"latest": stamp, "frames": [stamps ascending], "window_hours": 168}.
+WINDOW_HOURS deep), archive/flow/<YYYYMMDDHH>.png (optical flow over the
+hour that stamp starts, for shader-side advection), and manifest.json
+{"latest": stamp, "frames": [stamps ascending], "flows": [flow stamps],
+"window_hours": 168}.
 Every frame in the lookback newer than the published latest is archived,
 not just the newest, so a failed or cancelled run's hour backfills on
 the next one instead of holing the window.
@@ -47,6 +49,15 @@ BLEND_NONE = 65.0  # ... pure matteason above this; linear ramp between
 WINDOW_HOURS = 168
 JPEG_QUALITY = 85
 MAX_LOOKBACK_HOURS = 6
+# Optical flow between consecutive archive frames, for shader-side cloud
+# advection during replay. FLOW_MAX_UV is the full-scale displacement in
+# equirect UV units — must match FLOW_MAX_UV in the app's globe.frag,
+# which decodes uv_disp = (texel * 2 - 1) * FLOW_MAX_UV.
+FLOW_MAX_UV = 0.014  # sized above the ~0.011 UV in-band (|lat|<55) peak on
+# real GMGSI pairs so fast fronts/cirrus don't clip; the faster polar tail
+# does clip, but the shader dissolves flow to zero there anyway.
+FLOW_W, FLOW_H = 1024, 512
+FLOW_PAD = 64  # horizontal wrap pad (px) so dateline motion reads short
 # Content sanity for the matteason frame: a decodable-but-garbage image
 # (all black / all white / flat grey, or the wrong size) must fail the
 # run and keep the last good publish — the poisoned hour's archive frame
@@ -181,6 +192,97 @@ def write_archive_frame(px, stamp, outdir):
               quality=JPEG_QUALITY)
 
 
+def flow_uv(prev_px, next_px):
+    """Farneback optical flow prev -> next, in equirect UV units.
+
+    Inputs are FLOW_W x FLOW_H greyscale arrays. Both get wrap-padded
+    horizontally first so motion across the dateline reads as a short
+    hop, not a full-width jump; the pad is cropped off afterwards.
+    Pixel displacements become UV as (dx/FLOW_W, dy/FLOW_H) — row-down
+    positive dy already is increasing uv.y, so no sign flip — and clip
+    to +/-FLOW_MAX_UV, the shader's full-scale range."""
+    import cv2
+
+    def pad(a):
+        return np.hstack([a[:, -FLOW_PAD:], a, a[:, :FLOW_PAD]])
+
+    flow = cv2.calcOpticalFlowFarneback(
+        pad(prev_px), pad(next_px), None, pyr_scale=0.5, levels=5,
+        winsize=25, iterations=3, poly_n=7, poly_sigma=1.5,
+        flags=cv2.OPTFLOW_FARNEBACK_GAUSSIAN)
+    uv = flow[:, FLOW_PAD:FLOW_PAD + FLOW_W] \
+        / np.array([FLOW_W, FLOW_H], np.float32)
+    # A NaN would survive clip and cast to byte 0 = full-scale westward:
+    # a garbage streak in the replay. Farneback shouldn't produce one from
+    # finite uint8 input, but "shouldn't" is not a publish guarantee.
+    return np.clip(np.nan_to_num(uv), -FLOW_MAX_UV, FLOW_MAX_UV)
+
+
+def encode_flow(uv):
+    """UV flow to bytes: R = dx, G = dy (128 = still), B = 128 constant."""
+    px = np.full(uv.shape[:2] + (3,), 128, np.uint8)
+    px[..., :2] = np.round(np.clip(
+        (uv + FLOW_MAX_UV) / (2 * FLOW_MAX_UV), 0.0, 1.0) * 255.0)
+    return px
+
+
+def write_flow_frame(tag_a, tag_b, outdir):
+    """archive/flow/<tag_a>.png: cloud motion over the hour tag_a starts.
+
+    RGB with no alpha channel — the app's renderer premultiplies alpha
+    on decode, which would corrupt the displacement bytes."""
+    from PIL import Image
+
+    def load(tag):
+        return np.asarray(Image.open(
+            os.path.join(outdir, "archive", f"{tag}.jpg"))
+            .convert("L").resize((FLOW_W, FLOW_H), Image.LANCZOS))
+
+    os.makedirs(os.path.join(outdir, "archive", "flow"), exist_ok=True)
+    Image.fromarray(encode_flow(flow_uv(load(tag_a), load(tag_b))),
+                    mode="RGB") \
+        .save(os.path.join(outdir, "archive", "flow", f"{tag_a}.png"))
+
+
+def update_flows(frames, stamp, outdir):
+    """Fill missing flow maps, prune stale ones, return their stamps.
+
+    Every adjacent pair of archived frames exactly 1 h apart gets a map
+    named for the interval start; holes in the archive get none. Only
+    missing maps are computed — one Farneback solve (~1-3 s) per run in
+    the steady state, and the first deploy backfills the whole existing
+    window as a one-time cost of a few minutes. A flow map leaves the
+    window by the same rule as the frame it starts from."""
+    flowdir = os.path.join(outdir, "archive", "flow")
+    os.makedirs(flowdir, exist_ok=True)
+
+    def when(tag):
+        return dt.datetime.strptime(tag, "%Y%m%d%H") \
+            .replace(tzinfo=dt.timezone.utc)
+
+    for a, b in zip(frames, frames[1:]):
+        if (when(b) - when(a) == dt.timedelta(hours=1)
+                and not os.path.exists(os.path.join(flowdir, f"{a}.png"))):
+            # One unreadable archive JPEG must cost that pair its flow map
+            # (the app crossfades there), not fail the run — archive frames
+            # are never rewritten, so a hard fail here would block every
+            # future publish on a frame nothing will ever repair.
+            try:
+                write_flow_frame(a, b, outdir)
+            except Exception as e:
+                print(f"flow {a}->{b} skipped: {e}")
+    flows = []
+    for name in os.listdir(flowdir):
+        m = re.fullmatch(r"(\d{10})\.png", name)
+        if not m:
+            continue
+        if (stamp - when(m.group(1))) >= dt.timedelta(hours=WINDOW_HOURS):
+            os.remove(os.path.join(flowdir, name))
+        else:
+            flows.append(m.group(1))
+    return sorted(flows)
+
+
 def write_outputs(px, stamp, outdir):
     """current_8192/current_4096/archive frame, prune, rewrite manifest."""
     from PIL import Image
@@ -205,7 +307,8 @@ def write_outputs(px, stamp, outdir):
             os.remove(os.path.join(outdir, "archive", name))
         else:
             frames.append(m.group(1))
-    manifest = {"latest": tag, "frames": sorted(frames),
+    flows = update_flows(sorted(frames), stamp, outdir)
+    manifest = {"latest": tag, "frames": sorted(frames), "flows": flows,
                 "window_hours": WINDOW_HOURS}
     with open(os.path.join(outdir, "manifest.json"), "w") as f:
         json.dump(manifest, f)
@@ -265,17 +368,63 @@ def selftest():
     assert shell.max() <= 61, \
         f"masked fill bled into its neighbours: max {shell.max()}"
 
-    # A stale and a fresh archive frame: only the stale one gets pruned.
+    # Flow core: a dense field of small cloud-puff blobs rolled right by
+    # ~2 deg of longitude must read back as positive dx of that size.
+    # The texture must be fine-grained — this Farneback tuning tracks
+    # detail near its winsize (25 px) and averages the flat background
+    # into anything larger, under-reading isolated smooth shapes to near
+    # zero. Real IR frames at 1024x512 are exactly this kind of field.
+    rng = np.random.default_rng(0)
+    field = np.zeros((FLOW_H, FLOW_W), np.float32)
+    r = 12
+    yy, xx = np.mgrid[-r:r + 1, -r:r + 1]
+    puff = np.exp(-(yy ** 2 + xx ** 2) / (2 * 5.0 ** 2)) * 220.0
+    for _ in range(800):
+        cy = rng.integers(r, FLOW_H - r)
+        cols = (np.arange(-r, r + 1) + rng.integers(0, FLOW_W)) % FLOW_W
+        field[cy - r:cy + r + 1, cols] += puff
+    prev = np.round(field).clip(0, 255).astype(np.uint8)
+    shift = round(FLOW_W * 2.0 / 360.0)  # ~2 deg of longitude in px
+    uv = flow_uv(prev, np.roll(prev, shift, axis=1))
+    expect = shift / FLOW_W
+    med = float(np.median(uv[..., 0][prev > 60]))
+    assert 0.7 * expect < med < 1.3 * expect, \
+        f"blob flow off: median dx {med:.5f}, expected ~{expect:.5f}"
+    enc = encode_flow(uv)
+    assert enc.shape == (FLOW_H, FLOW_W, 3) and enc.dtype == np.uint8
+    assert np.all(enc[..., 2] == 128), "B channel must stay 128"
+    dec = enc[..., :2] / 255.0 * (2 * FLOW_MAX_UV) - FLOW_MAX_UV
+    assert np.abs(dec - uv).max() <= 2 * FLOW_MAX_UV / 255.0, \
+        "encode/decode must round-trip within one quantization step"
+
+    # A stale and a fresh archive frame: only the stale one gets pruned,
+    # and its flow map goes with it. The fresh frame is real data (the
+    # flow pass decodes it) one hour before the latest, so the adjacent
+    # pair yields archive/flow/2026071823.png — identical frames, near-
+    # still bytes.
     stamp = dt.datetime(2026, 7, 19, 0, tzinfo=dt.timezone.utc)
-    os.makedirs(os.path.join(outdir, "archive"), exist_ok=True)
-    for tag in ("2026071100", "2026071823"):
-        open(os.path.join(outdir, "archive", f"{tag}.jpg"), "wb").close()
+    os.makedirs(os.path.join(outdir, "archive", "flow"), exist_ok=True)
+    open(os.path.join(outdir, "archive", "2026071100.jpg"), "wb").close()
+    open(os.path.join(outdir, "archive", "flow", "2026071100.png"),
+         "wb").close()
+    write_archive_frame(px, stamp - dt.timedelta(hours=1), outdir)
     manifest = write_outputs(px, stamp, outdir)
     assert manifest == {"latest": "2026071900",
                         "frames": ["2026071823", "2026071900"],
+                        "flows": ["2026071823"],
                         "window_hours": WINDOW_HOURS}, manifest
     assert not os.path.exists(os.path.join(outdir, "archive",
                                            "2026071100.jpg")), "prune failed"
+    assert not os.path.exists(os.path.join(outdir, "archive", "flow",
+                                           "2026071100.png")), \
+        "flow prune failed"
+    from PIL import Image
+    fp = Image.open(os.path.join(outdir, "archive", "flow",
+                                 "2026071823.png"))
+    assert fp.size == (FLOW_W, FLOW_H) and fp.mode == "RGB", \
+        (fp.size, fp.mode)
+    assert np.abs(np.asarray(fp).astype(np.int16) - 128).max() <= 1, \
+        "identical frames must encode as (near-)zero motion"
     print(f"selftest ok: {outdir}", px.shape)
 
 

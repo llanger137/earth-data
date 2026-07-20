@@ -31,9 +31,18 @@ https://llanger137.github.io/earth-data/clouds/manifest.json
 https://llanger137.github.io/earth-data/clouds/archive/<YYYYMMDDHH>.jpg
 ```
 
-`manifest.json` is `{"latest", "frames", "window_hours"}`: `frames`
-lists the archived UTC hour stamps (ascending) over a rolling 7-day
-window; `archive/` holds exactly those frames at 4096×2048.
+`manifest.json` is `{"latest", "frames", "flows", "window_hours"}`:
+`frames` lists the archived UTC hour stamps (ascending) over a rolling
+7-day window; `archive/` holds exactly those frames at 4096×2048.
+
+`archive/flow/<YYYYMMDDHH>.png` — optical flow between consecutive
+archive frames, for shader-side cloud advection during replay. `<stamp>`
+is the interval start: the map holds the motion from that frame to the
+next hour's. 1024×512 RGB PNG (no alpha): R = Δu, G = Δv in
+equirectangular UV per hour, encoded as
+`byte = round(clip((v + 0.014) / 0.028, 0, 1) · 255)` — 128 is no motion,
+full scale ±0.014 UV — with B constant 128. Stamps with a map are listed
+in `manifest.json` as `flows`; a gap in the archive gets no map.
 
 One-time setup: push the repo, run the `clouds` workflow once by hand to
 seed the `data` branch, then enable GitHub Pages serving from `data` /
