@@ -31,10 +31,20 @@ LUT):
     79-95 with clear night land, an ambiguity no per-pixel mapping can
     break, so this zone renders dim-but-present (~10-60) rather than
     black or bright;
-  * steep rise 105..190 - where matteason-white cloud lives (its solid
+  * steep rise 105..165 - where matteason-white cloud lives (its solid
     cloud has IR p25 = 112, p50 = 140, p75 = 169), giving fronts and
     convection their white;
-  * saturation >= 190 - cold tops go near-white; 255 stays 255.
+  * even shoulder 165..240 - anvils and cold tops climb in near-equal
+    steps instead of slamming into white at 190.  Retuned 2026-07-24
+    (user: convective systems rendered as flat white mass): on that
+    day's 14Z frame, bright cloud (>= 165) in the Illinois MCS and Gulf
+    convection spanned only 165..206, yet the old (190, 247) shoulder
+    put half to two-thirds of those pixels at >= 240 out - a storm's
+    whole interior collapsed into ~6 output levels (and the app shader's
+    pow 1.6 opacity then pinned them all near 1.0).  Near-white now
+    waits for IR 240; a ~205 top sits at ~232, giving an interior ~24
+    levels of spread where it had ~6;
+  * 255 stays 255.
 Tuned against the matteason 8192x4096 frame of the same hour using
 class-conditional stats (matteason<=10 vs >=220 pixel populations over
 60S-60N) and side-by-side renders of both day and night hemispheres.
@@ -69,8 +79,10 @@ CONTROL_POINTS = (
     (88, 25),     # toe: stratus / clear-land ambiguity stays dim
     (105, 60),
     (135, 140),   # mid cloud picks up body
-    (165, 218),
-    (190, 247),   # cold tops saturate
+    (165, 196),   # frontal sheets: bright, no longer blown out
+    (190, 220),   # convective anvils keep visible gradation...
+    (215, 238),
+    (240, 250),   # ...out to the rare extreme tops
     (255, 255),
 )
 
@@ -127,7 +139,10 @@ def selftest():
     assert np.all(np.diff(out.astype(np.int32)) >= 0), "must be monotone"
     assert out[0] == 0 and out[70] == 0, "clear surface must be black"
     assert out[255] == 255, "coldest value must be white"
-    assert out[190] >= 240, "cold tops must be near-white"
+    assert out[240] >= 245, "extreme tops must stay near-white"
+    assert 210 <= out[190] <= 230, "anvils must be bright but not blown out"
+    assert out[240] - out[190] >= 20, \
+        "storm interiors must keep tonal separation (2026-07-24 retune)"
     assert 5 <= out[88] <= 45, "stratus zone must be dim but present"
     assert 100 <= out[135] <= 180, "mid cloud must keep structure"
 
@@ -138,7 +153,8 @@ def selftest():
     assert px[0, 0, 0] == 0 and px[0, 0, 1] == 0, "fill/NaN must be black"
     assert px[1, 1, 0] == 255, "255 (incl. dqf fill) stays white"
     print("selftest ok: LUT",
-          [int(_LUT[v]) for v in (0, 70, 88, 105, 135, 165, 190, 255)])
+          [int(_LUT[v]) for v in (0, 70, 88, 105, 135, 165, 190, 215, 240,
+                                  255)])
 
 
 def _load_gmgsi(path):
