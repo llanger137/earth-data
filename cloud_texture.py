@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the latest GMGSI longwave-IR mosaic and build the cloud textures.
+"""Fetch the latest GMGSI IR mosaics and build the cloud textures.
 
 The Earth app drapes live clouds over the globe. This script feeds it
 hourly: pull NOAA's GMGSI global geostationary IR composite (anonymous
@@ -10,6 +10,16 @@ polar caps — GMGSI stops at ~72.7 deg — from the matteason visible cloud
 map (CC0, 3-hourly).  GMGSI missing-data fill (dqf != 0: the bowl above
 the Meteosat-IODC disk edge, thin sector-seam strips) also falls through
 to matteason instead of printing as saturated white.
+
+Two GMGSI channels are read, not one.  Longwave (11 um) carries the
+picture; shortwave (3.9 um) is read only to recover warm low cloud, whose
+top is so close to the ground's own temperature that longwave cannot
+separate the two — see sw_fusion.py for the physics, the validation, and
+the places the rescue deliberately declines to fire.  Shortwave enters as
+a shift in longwave counts applied before the tone curve, so the curve's
+tuning survives untouched and the app needs no change at all.  If the
+shortwave frame is missing or unreadable the run publishes longwave-only
+output, exactly as it did before the channel was added.
 
 Blend: pure GMGSI for |lat| <= BLEND_FULL, linear ramp to BLEND_NONE,
 pure matteason above. Outputs land in <outdir>: current_8192.jpg,
@@ -41,6 +51,13 @@ import numpy as np
 
 S3 = "https://noaa-gmgsi-pds.s3.amazonaws.com"
 PRODUCT = "GMGSI_LW"
+# The 3.9um companion, used only to rescue warm low cloud that LW alone
+# renders as clear sky (sw_fusion.py). Same blend, same grid, same
+# 10-minute window; published a few minutes after LW (15:36 vs 15:39 on
+# 2026-07-25), comfortably before this workflow's :45 run. When it is
+# missing or unreadable the run continues on LW alone, which is exactly
+# the output this pipeline produced before the channel was added.
+PRODUCT_SW = "GMGSI_SW"
 MATTEASON_URL = "https://clouds.matteason.co.uk/images/8192x4096/clouds.jpg"
 WIDTH, HEIGHT = 8192, 4096
 BLEND_FULL = 60.0  # pure GMGSI up to this |lat| ...
@@ -103,6 +120,80 @@ def find_frames(now):
         raise SystemExit(f"no {PRODUCT} frame in the last "
                          f"{MAX_LOOKBACK_HOURS}h")
     return keys
+
+
+def sw_lookup(lw_key):
+    """(S3 prefix listing the SW hour, the LW frame's own `_s` stamp).
+
+    Split out from the fetch so the string handling is testable without
+    network: getting it wrong pairs two frames that only look related.
+    """
+    m = re.search(r"_s(\d+)", lw_key)
+    if not m:
+        return None, None
+    head = lw_key.rsplit("/", 1)[0]
+    if not head.startswith(f"{PRODUCT}/"):
+        return None, None
+    return f"{PRODUCT_SW}/{head[len(PRODUCT) + 1:]}/", m.group(1)
+
+
+def find_sibling_sw(lw_key):
+    """The GMGSI_SW key covering the same start time as `lw_key`, or None.
+
+    Matched on the filename's own `_s<stamp>` token rather than by taking
+    the newest key in the hour: the two products are produced by separate
+    jobs, and pairing a 15:00 LW frame with a 15:10 SW frame would put a
+    10-minute parallax into a per-pixel channel difference.
+    """
+    import requests
+
+    prefix, stamp = sw_lookup(lw_key)
+    if not prefix:
+        return None
+    r = requests.get(S3, params={"list-type": "2", "prefix": prefix},
+                     timeout=60)
+    r.raise_for_status()
+    for k in sorted(re.findall(r"<Key>([^<]+)</Key>", r.text)):
+        if f"_s{stamp}" in k:
+            return k
+    return None
+
+
+def low_cloud_boost(lw_key, ir, lat, lon, stamp):
+    """LW counts to add so warm low cloud stops reading as clear sky.
+
+    Returns None -- meaning "publish LW-only, exactly as before this
+    channel existed" -- for every failure: no sibling frame yet, a fetch
+    error, a grid that does not match. A missing SW hour must cost that
+    hour its low cloud, never the whole publish; archive/ is never
+    rewritten, so a hard failure here would hole the replay window
+    permanently.
+
+    `ir`, `lat`, `lon` are already oriented; `stamp` is the frame's own
+    UTC time, so a backfilled hour gets that hour's terminator and not
+    the terminator of whenever the run happens to be catching up.
+    """
+    from sw_fusion import low_cloud_shift, solar_zenith_cos
+
+    try:
+        key = find_sibling_sw(lw_key)
+        if not key:
+            print(f"no {PRODUCT_SW} sibling for {lw_key}; LW-only this hour",
+                  file=sys.stderr)
+            return None
+        sw, swbad, slat, slon, _ = read_gmgsi(fetch(f"{S3}/{key}"))
+        if sw.shape != ir.shape:
+            print(f"{PRODUCT_SW} grid {sw.shape} != {PRODUCT} {ir.shape}; "
+                  f"LW-only this hour", file=sys.stderr)
+            return None
+        sw, _, _ = orient(sw, slat, slon)
+        swbad, _, _ = orient(swbad, slat, slon)
+        return low_cloud_shift(ir, sw, solar_zenith_cos(lat, lon, stamp),
+                               lat, bad=swbad > 0.5)
+    except Exception as e:
+        print(f"{PRODUCT_SW} fusion skipped ({e}); LW-only this hour",
+              file=sys.stderr)
+        return None
 
 
 def fetch(url):
@@ -524,6 +615,23 @@ def selftest():
         "equator seam must be dropped"
     assert aur[90 - (-80), (0 + 180) % AURORA_W, 0] == 0, "far cell not dark"
 
+    # Shortwave sibling lookup: same date path under the SW product, and
+    # the LW frame's own start stamp carried across so the two frames are
+    # paired by observation time rather than by "newest in the hour".
+    lwk = ("GMGSI_LW/2026/07/25/15/GLOBCOMPLIR_v3r0_blend_s202607251500000"
+           "_e202607251509599_c202607251536500.nc")
+    pre, sstamp = sw_lookup(lwk)
+    assert pre == "GMGSI_SW/2026/07/25/15/", pre
+    assert sstamp == "202607251500000", sstamp
+    # The real 15Z pair differs in creation time (c...1536500 vs c...1539153)
+    # and in the product token (LIR vs SIR), so matching must key on _s only.
+    swk = ("GMGSI_SW/2026/07/25/15/GLOBCOMPSIR_v3r0_blend_s202607251500000"
+           "_e202607251509599_c202607251539153.nc")
+    assert f"_s{sstamp}" in swk and swk.startswith(pre)
+    other = swk.replace("_s202607251500000", "_s202607251510000")
+    assert f"_s{sstamp}" not in other, "a 15:10 frame must not match 15:00"
+    assert sw_lookup("nonsense.nc") == (None, None)
+
     # Aurora archive lands under the newest hour, prunes stale on the window.
     open(os.path.join(outdir, "archive", "aurora", "2026071100.png"),
          "wb").close()
@@ -600,9 +708,21 @@ def main():
     # (it's 3-hourly anyway); only the newest frame becomes current_*.
     for key in new:
         ir, bad, lat, lon, stamp = read_gmgsi(fetch(f"{S3}/{key}"))
-        vis, _, _ = orient(to_visible(ir), lat, lon)
-        bad, lat, lon = orient(bad, lat, lon)
-        px = composite(vis, bad, lat, lon, canvas)
+        # Orient before the curve now, because the shortwave rescue needs
+        # latitude and the terminator per pixel, and both are only
+        # meaningful once rows are north-up and columns start at -180.
+        ir, olat, olon = orient(ir, lat, lon)
+        bad, _, _ = orient(bad, lat, lon)
+        # The shift goes in BEFORE the tone curve, not after it: "this
+        # cloud is warmer than it looks" is a statement about the input
+        # value, so shifting there inherits the curve's monotonicity and
+        # leaves its tuned mid/shoulder section (the 2026-07-24
+        # convective retune) untouched.
+        boost = low_cloud_boost(key, ir, olat, olon, stamp)
+        if boost is not None:
+            ir = ir + boost
+        vis = to_visible(ir)
+        px = composite(vis, bad, olat, olon, canvas)
         if key is new[-1]:
             manifest = write_outputs(px, stamp, args.outdir, aurora_rgba)
         else:

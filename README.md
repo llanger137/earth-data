@@ -14,7 +14,21 @@ hourly.
 Source: [NOAA GMGSI](https://www.ospo.noaa.gov/products/imagery/gmgsi/)
 longwave-IR — the global geostationary mosaic on anonymous public S3
 (hourly, ~40 min latency, no credentials). Brightness temperature
-becomes a visible-style cloud mask in [ir_visible.py](ir_visible.py);
+becomes a visible-style cloud mask in [ir_visible.py](ir_visible.py).
+
+A second GMGSI channel, shortwave 3.9 µm, rescues the low cloud that
+longwave alone cannot see: a warm stratus top sits at nearly the ground's
+own 11 µm temperature, so the curve in `ir_visible.py` has to render that
+whole band dim or paint every clear night desert white. At 3.9 µm cloud
+and ground do differ — cloud reflects sunlight by day and emits with
+lower emissivity by night, so the sign of the difference flips at the
+terminator. [sw_fusion.py](sw_fusion.py) turns that into a shift in
+longwave counts applied *before* the tone curve, along with the measured
+evidence, the validation numbers, and the three regions where it
+deliberately does nothing (near the terminator, poleward of ~55°, and
+anywhere longwave already reads cold). A missing or unreadable shortwave
+frame just costs that hour its low cloud; the run still publishes.
+
 GMGSI stops at ~72.7°, so the polar caps come from the
 [matteason](https://clouds.matteason.co.uk) visible cloud map (CC0),
 alpha-ramped in between 60° and 65° — tuned down from the nominal 64–71°
