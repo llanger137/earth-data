@@ -36,6 +36,15 @@ band to keep the degraded Meteosat-IODC limb (a missing-data bowl
 bottoming ~66°N) below the blend. Pipeline and tuning constants
 (`BLEND_FULL`/`BLEND_NONE`) in [cloud_texture.py](cloud_texture.py).
 
+Nothing in geostationary orbit sees a pole, so that cap is matteason's
+invention — near-full longitudinal contrast at 84°, which the converging
+equirect grid funnels into a radial starburst, sitting on a flat fill
+brighter than the belt around it. `depole` averages each row over a fixed
+arc on the ground and holds the whole cap at the zonal mean of the last
+belt that was actually observed, ramped in over 72–84° so rows below come
+back untouched and the cap has no rim: one brightness, no invented
+structure.
+
 Published via GitHub Pages from the `data` branch:
 
 ```

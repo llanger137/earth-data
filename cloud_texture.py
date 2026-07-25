@@ -22,7 +22,10 @@ shortwave frame is missing or unreadable the run publishes longwave-only
 output, exactly as it did before the channel was added.
 
 Blend: pure GMGSI for |lat| <= BLEND_FULL, linear ramp to BLEND_NONE,
-pure matteason above. Outputs land in <outdir>: current_8192.jpg,
+pure matteason above.  Above BLEND_NONE nothing observed anything, so the
+caps are smoothed to a single brightness carried up from the last belt
+that did (depole) rather than left to print matteason's fill as a
+starburst.  Outputs land in <outdir>: current_8192.jpg,
 current_4096.jpg, archive/<YYYYMMDDHH>.jpg (frame's own UTC hour, rolling
 WINDOW_HOURS deep), archive/flow/<YYYYMMDDHH>.png (optical flow over the
 hour that stamp starts, for shader-side advection), archive/aurora/
@@ -65,6 +68,17 @@ BLEND_NONE = 65.0  # ... pure matteason above this; linear ramp between
 # (60..65 rather than the GMGSI edge ~72.7: the Meteosat-IODC sector is
 # saturated missing-data fill above its disk edge, a bowl bottoming ~66N
 # with hard boundaries that show through any higher band.)
+# Pole treatment (depole below). No geostationary satellite sees a pole,
+# so matteason's cap is invented: a flat 232 above ~87 deg, and below that
+# a belt whose longitudinal contrast the converging equirect grid funnels
+# into a radial starburst. POLE_NONE stays clear of BLEND_NONE so the
+# reference belt reads matteason only, never the GMGSI blend below it.
+POLE_NONE = 72.0  # untouched up to this |lat| ...
+POLE_FULL = 84.0  # ... fully smoothed above; smoothstep between
+POLE_ARC_KM = 440.0  # longitudinal kernel measured on the ground, not in
+# pixels, so it means the same thing on the 8192 canvas and the 4096 output
+POLE_BELT = 6.0  # depth of the reference belt just below POLE_NONE
+EARTH_CIRC_KM = 40030.0
 WINDOW_HOURS = 168
 JPEG_QUALITY = 85
 MAX_LOOKBACK_HOURS = 6
@@ -277,6 +291,66 @@ def composite(vis, bad, lat, lon, canvas):
     alpha = alpha.astype(np.float32)[:, None] * np.clip(w, 0.0, 1.0)
     out = canvas.astype(np.float32)
     out[i0:i1 + 1] = out[i0:i1 + 1] * (1.0 - alpha) + band * alpha
+    return np.round(out).clip(0, 255).astype(np.uint8)
+
+
+def _smoothstep(x, edge0, edge1):
+    t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def _ring_mean(row, n, passes=2):
+    """Circular moving average of `n` columns, wrapping at the dateline.
+    Two box passes rather than one: a single box leaves visible corners
+    where the kernel steps on and off a bright feature."""
+    w = row.size
+    for _ in range(passes):
+        pad = n // 2
+        ext = np.concatenate([row[-pad:], row, row[:n - pad]])
+        cs = np.concatenate([[0.0], np.cumsum(ext, dtype=np.float64)])
+        row = ((cs[n:n + w] - cs[:w]) / n).astype(np.float32)
+    return row
+
+
+def depole(px):
+    """Stop the invented polar caps from printing as radial starbursts.
+
+    Nothing in geostationary orbit can see a pole, so everything above
+    ~72 deg here is matteason's fill rather than an observation, and it
+    arrives with two separate tells.  Its longitudinal contrast is still
+    near full strength at 84 deg (row std ~8 where the grid has already
+    squeezed 360 deg of longitude into an arc a few hundred km wide), so
+    the projection funnels it into a star with its point on the pole.
+    And above ~87 deg it is a flat 232 — brighter than the 206 belt it
+    sits inside, which renders the star on a glowing disc.
+
+    So: average each row over a fixed arc on the ground (POLE_ARC_KM),
+    which widens in columns as the grid converges, and hold the whole cap
+    at the zonal mean of the last belt below it.  Both ramp in over
+    POLE_NONE..POLE_FULL, so rows equatorward of POLE_NONE come back
+    untouched and the cap has no rim.  The result is the honest rendering
+    of a place nothing observed: one brightness, no invented structure,
+    matching the latitude that did get looked at.
+    """
+    out = px.astype(np.float32).copy()
+    h, w = out.shape
+    lat = 90.0 - (np.arange(h) + 0.5) * (180.0 / h)
+    cosl = np.maximum(np.cos(np.radians(lat)), 1e-9)
+    frac = _smoothstep(np.abs(lat), POLE_NONE, POLE_FULL)
+
+    for i in np.nonzero(frac > 0.0)[0]:
+        n = int(min(w, max(2, round(POLE_ARC_KM * w
+                                    / (EARTH_CIRC_KM * cosl[i])))))
+        out[i] += frac[i] * (_ring_mean(out[i], n) - out[i])
+
+    # Measure the belt after the blur, not before: the reference has to be
+    # the mean the smoothing actually converges to.
+    zonal = out.mean(axis=1)
+    for sign in (1.0, -1.0):
+        sl = sign * lat
+        ref = zonal[(sl > POLE_NONE - POLE_BELT) & (sl <= POLE_NONE)].mean()
+        rows = np.nonzero(sl > POLE_NONE)[0]
+        out[rows] += (frac[rows] * (ref - zonal[rows]))[:, None]
     return np.round(out).clip(0, 255).astype(np.uint8)
 
 
@@ -534,6 +608,36 @@ def selftest():
     assert shell.max() <= 61, \
         f"masked fill bled into its neighbours: max {shell.max()}"
 
+    # depole, on a caricature of what matteason actually delivers: a
+    # uniform belt, wedges above 74 deg standing in for the starburst
+    # (harsher than the real ~8-30 row std up there), and an invented
+    # flat cap above 87 deg brighter than the belt it sits in. Run at a
+    # different grid size than the canvas, since the kernel is measured
+    # on the ground and must not care about resolution.
+    ph, pw = 512, 1024
+    plat = 90.0 - (np.arange(ph) + 0.5) * (180.0 / ph)
+    star = np.full((ph, pw), 200, np.uint8)
+    star[np.abs(plat) > 74.0] = np.where(
+        (np.arange(pw) * 12 // pw) % 2, 255, 120)
+    star[np.abs(plat) > 87.0] = 250
+    fixed = depole(star)
+    below = np.abs(plat) <= POLE_NONE
+    assert np.array_equal(star[below], fixed[below]), \
+        "depole reached below POLE_NONE"
+    for sign in (1, -1):
+        near = int(np.argmin(np.abs(plat - sign * 88.0)))
+        at_full = int(np.argmin(np.abs(plat - sign * POLE_FULL)))
+        assert fixed[near].std() < 1.0, \
+            f"starburst survived at the pole: std {fixed[near].std():.1f}"
+        assert fixed[at_full].std() < star[at_full].std() / 4.0, \
+            f"POLE_FULL barely smoothed: std {fixed[at_full].std():.1f}"
+        # The invented cap must be held at the belt below it (200), not
+        # left to glow at its own fill value (250).
+        assert abs(float(fixed[near].mean()) - 200.0) < 1.5, \
+            f"cap not carried to the belt mean: {fixed[near].mean():.1f}"
+    assert POLE_NONE - POLE_BELT > BLEND_NONE, \
+        "reference belt must read matteason only, not the GMGSI blend"
+
     # Flow core: a dense field of small cloud-puff blobs rolled right by
     # ~2 deg of longitude must read back as positive dx of that size.
     # The texture must be fine-grained — this Farneback tuning tracks
@@ -722,7 +826,7 @@ def main():
         if boost is not None:
             ir = ir + boost
         vis = to_visible(ir)
-        px = composite(vis, bad, olat, olon, canvas)
+        px = depole(composite(vis, bad, olat, olon, canvas))
         if key is new[-1]:
             manifest = write_outputs(px, stamp, args.outdir, aurora_rgba)
         else:
