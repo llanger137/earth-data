@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Run a command, retrying with backoff. GitHub's git endpoints throw the
+# odd 500/504 that clears within minutes; unretried, one of those fails
+# the whole data run and mails a red cross. Only the command's first two
+# words are echoed — the push URL carries the token.
+for delay in 20 60 120; do
+  "$@" && exit 0
+  echo "::warning::$1 $2 failed; retrying in ${delay}s" >&2
+  sleep "$delay"
+done
+exec "$@"

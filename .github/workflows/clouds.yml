@@ -47,9 +47,9 @@ jobs:
           # fail the job: publishing from an unseeded tree would truncate
           # the archive and drop sibling datasets.
           rc=0
-          git ls-remote --exit-code origin data >/dev/null || rc=$?
+          ./retry git ls-remote --exit-code origin data >/dev/null || rc=$?
           if [ "$rc" -eq 0 ]; then
-            git fetch --depth 1 origin data
+            ./retry git fetch --depth 1 origin data
             git archive FETCH_HEAD | tar -x -C out
           elif [ "$rc" -ne 2 ]; then
             echo "cannot reach origin (exit $rc); refusing an unseeded build"
@@ -81,7 +81,7 @@ jobs:
           tree=$(git write-tree)
           commit=$(git -c user.name="clouds bot" -c user.email="actions@github.com" \
             commit-tree -m "clouds $(date -u +%FT%TZ)" "$tree")
-          git push -q --force \
+          ./retry git push -q --force \
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "$commit:refs/heads/data"
         env:
